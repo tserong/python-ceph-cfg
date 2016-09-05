@@ -12,8 +12,35 @@ from . import constants
 from . import util_which
 
 
-log = logging.getLogger(__name__)
+KEYRINGS = {
+    "admin": {
+        "path": "/etc/ceph/%s.client.admin.keyring",
+        "name": "client.admin",
+        "caps": { "mon": "allow *", "osd": "allow *", "mds": "allow *" },
+    },
+    "mon": {
+        "path": os.path.join(constants._path_ceph_lib, "bootstrap-mon/%s.keyring"),
+        "name": "mon.",
+        "caps": { "mon": "allow *" },
+    },
+    "osd": {
+        "path": os.path.join(constants._path_ceph_lib, "bootstrap-osd/%s.keyring"),
+        "name": "client.bootstrap-osd",
+        "caps": { "mon": "allow profile bootstrap-osd" },
+    },
+    "mds": {
+        "path": os.path.join(constants._path_ceph_lib, "bootstrap-mds/%s.keyring"),
+        "name": "client.bootstrap-mds",
+        "caps": { "mon": "allow profile bootstrap-mds" },
+    },
+    "rgw": {
+        "path": os.path.join(constants._path_ceph_lib, "bootstrap-rgw/%s.keyring"),
+        "name": "client.bootstrap-rgw",
+        "caps": { "mon": "allow profile bootstrap-rgw" },
+    },
+}
 
+log = logging.getLogger(__name__)
 
 class Error(Exception):
     """
@@ -24,33 +51,13 @@ class Error(Exception):
         doc = self.__doc__.strip()
         return ': '.join([doc] + [str(a) for a in self.args])
 
-def _get_path_keyring_admin(cluster_name):
-    return '/etc/ceph/%s.client.admin.keyring' % (cluster_name)
-
-
-def _get_path_keyring_mon(cluster_name):
-    # Get the path for the mon bootstrap keyring.
-    return os.path.join(constants._path_ceph_lib, 'bootstrap-mon/%s.keyring' % (cluster_name))
-
-
-def _get_path_keyring_osd(cluster_name):
-    return os.path.join(constants._path_ceph_lib, 'bootstrap-osd/%s.keyring' % (cluster_name))
-
-def _get_path_keyring_mds(cluster_name):
-    return os.path.join(constants._path_ceph_lib, 'bootstrap-mds/%s.keyring' % (cluster_name))
-
-
-def _get_path_keyring_rgw(cluster_name):
-    return os.path.join(constants._path_ceph_lib, 'bootstrap-rgw/%s.keyring' % (cluster_name))
-
-
-def _keying_read(key_path):
+def _keyring_read(key_path):
     output = ""
     with open(key_path, 'r') as infile:
         output = infile.read()
     return output
 
-def _keying_write(key_path,content):
+def _keyring_write(key_path,content):
     dirname = os.path.dirname(key_path)
     if not os.path.isdir(dirname):
         os.makedirs(dirname)
@@ -66,16 +73,11 @@ def _keying_write(key_path,content):
     return
 
 
-def Property(func):
-    return property(**func())
+class keyring_facard(object):
+    key_type = None
 
-
-
-
-class keyring_implementation_base(object):
     def __init__(self, mdl):
         self.model = mdl
-
 
     def invoke_ceph_authtool(self, keyring_name, keyring_path, caps, secret=None, extra_args=[]):
         """create arguments for invoking the ceph authtool, this simplifies most of
@@ -109,23 +111,29 @@ class keyring_implementation_base(object):
         return args
 
 
+    def get_arguments_create(self, path, secret=None):
+        extra_args=[]
+        # Not sure why this special case is necessary for the admin key
+        if self.key_type == "admin":
+            if self.model.ceph_version.major == 0:
+                if self.model.ceph_version.minor < 95:
+                    extra_args+=["--set-uid=0"]
+        return self.invoke_ceph_authtool(self.keyring_identity_get(), path, KEYRINGS[self.key_type]["caps"], secret=secret, extra_args=extra_args)
+
+
     def present(self):
         """
-        Is keyring present
+        Check if keyring is present
         """
-        keyring_path = self.get_path_keyring()
-        if os.path.isfile(keyring_path):
-            return True
-        return False
+        return os.path.isfile(self.keyring_path_get())
 
 
     def create(self, secret = None):
         """
         Create keyring
         """
-        keyring_path = self.get_path_keyring()
-        if os.path.isfile(keyring_path):
-            return _keying_read(keyring_path)
+        if self.present():
+            return _keyring_read(self.keyring_path_get())
         try:
             tmpd = tempfile.mkdtemp()
             key_path = os.path.join(tmpd,"keyring")
@@ -138,7 +146,7 @@ class keyring_implementation_base(object):
                     cmd_out["stdout"],
                     cmd_out["stderr"])
                     )
-            output = _keying_read(key_path)
+            output = _keyring_read(key_path)
         finally:
             shutil.rmtree(tmpd)
         return output
@@ -148,10 +156,9 @@ class keyring_implementation_base(object):
         """
         Persist keyring
         """
-        keyring_path = self.get_path_keyring()
-        if os.path.isfile(keyring_path):
+        if self.present():
             return True
-        _keying_write(keyring_path, key_content)
+        _keyring_write(self.keyring_path_get(), key_content)
         return True
 
 
@@ -159,15 +166,14 @@ class keyring_implementation_base(object):
         """
         Persist keyring
         """
-        keyring_path = self.get_path_keyring()
-        if os.path.isfile(keyring_path):
+        if os.path.isfile(self.keyring_path_get()):
             return True
         if secret is None:
             raise Error("Keyring secret is invalid")
-        keyring_dir = os.path.dirname(keyring_path)
+        keyring_dir = os.path.dirname(self.keyring_path_get())
         if not os.path.isdir(keyring_dir):
             os.makedirs(keyring_dir)
-        arguments = self.get_arguments_create(keyring_path, secret)
+        arguments = self.get_arguments_create(self.keyring_path_get(), secret)
         cmd_out = utils.execute_local_command(arguments)
         if cmd_out["retcode"] != 0:
             raise Error("Failed executing '%s' Error rc=%s, stdout=%s stderr=%s" % (
@@ -181,209 +187,27 @@ class keyring_implementation_base(object):
 
     def remove(self):
         """
-        Delete keyring
+        Remove keyring
         """
-        keyring_path = self.get_path_keyring()
-        if os.path.isfile(keyring_path):
-            log.info("Removing:%s" % (keyring_path))
+        if self.present():
+            log.info("Removing: %s" % (self.keyring_path_get()))
             try:
-                os.remove(keyring_path)
+                os.remove(self.keyring_path_get())
             except OSError:
                 raise Error("Keyring could not be deleted")
         return True
-
-
-class keyring_implementation_admin(keyring_implementation_base):
-    def __init__(self, mdl):
-        keyring_implementation_base.__init__(self, mdl)
-        self.keyring_name = "client.admin"
-        self.caps = {"mon":"allow *", "osd":"allow *", "mds":"allow *"}
-
-    def get_path_keyring(self):
-        return _get_path_keyring_admin(self.model.cluster_name)
-
-    def get_arguments_create(self, path, secret=None):
-        extra_args=[]
-        if self.model.ceph_version.major == 0:
-            if self.model.ceph_version.minor < 95:
-                extra_args+=["--set-uid=0"]
-        return self.invoke_ceph_authtool(self.keyring_name, path, self.caps, secret=secret, extra_args=extra_args)
-
-class keyring_implementation_mon(keyring_implementation_base):
-    def __init__(self, mdl):
-        keyring_implementation_base.__init__(self, mdl)
-        self.keyring_name = "mon."
-        self.caps = {"mon": "allow *"}
-
-    def get_path_keyring(self):
-        if self.model.cluster_name is None:
-            raise  Error("Cluster name not found")
-        return _get_path_keyring_mon(self.model.cluster_name)
-
-    def get_arguments_create(self, path, secret=None):
-        return self.invoke_ceph_authtool(self.keyring_name, path, self.caps, secret=secret)
-
-
-class keyring_implementation_osd(keyring_implementation_base):
-    def __init__(self, mdl):
-        keyring_implementation_base.__init__(self, mdl)
-        self.keyring_name = "client.bootstrap-osd"
-        self.caps = {"mon": "allow profile bootstrap-osd"}
-
-    def get_path_keyring(self):
-        if self.model.cluster_name is None:
-            raise  Error("Cluster name not found")
-        return _get_path_keyring_osd(self.model.cluster_name)
-
-    def get_arguments_create(self, path, secret=None):
-        return self.invoke_ceph_authtool(self.keyring_name, path, self.caps, secret=secret)
-
-class keyring_implementation_rgw(keyring_implementation_base):
-    def __init__(self, mdl):
-        keyring_implementation_base.__init__(self, mdl)
-        self.keyring_name = "client.bootstrap-rgw"
-        self.caps = {"mon": "allow profile bootstrap-rgw"}
-
-    def get_path_keyring(self):
-        if self.model.cluster_name is None:
-            raise  Error("Cluster name not found")
-        return _get_path_keyring_rgw(self.model.cluster_name)
-
-
-    def get_arguments_create(self, path, secret=None):
-        return self.invoke_ceph_authtool(self.keyring_name, path, self.caps, secret=secret)
-
-
-class keyring_implementation_mds(keyring_implementation_base):
-    def __init__(self, mdl):
-        keyring_implementation_base.__init__(self, mdl)
-        self.keyring_name = "client.bootstrap-mds"
-        self.caps = {"mon": "allow profile bootstrap-mds"}
-
-    def get_path_keyring(self):
-        if self.model.cluster_name is None:
-            raise  Error("Cluster name not found")
-        return _get_path_keyring_mds(self.model.cluster_name)
-
-    def get_arguments_create(self, path, secret=None):
-        return self.invoke_ceph_authtool(self.keyring_name, path, self.caps, secret=secret)
-
-
-class keyring_facard(object):
-    def __init__(self, mdl):
-        self.model = mdl
-        self._availableKeys = set(["admin", "mds", "mon", "osd", "rgw"])
-        self._clear_implementation()
-
-
-    def _clear_implementation(self):
-        self._keyType = None
-        self._keyImp = None
-
-
-    @Property
-    def key_type():
-        doc = "key_type"
-
-        def fget(self):
-            return self._keyType
-
-
-        def fset(self, name):
-            if name is None:
-                self._clear_implementation()
-            if not name in self._availableKeys:
-                self._clear_implementation()
-                raise ValueError("Invalid key_type with value:%s" % (name))
-            implementation = None
-            if name == "admin":
-                implementation = keyring_implementation_admin(self.model)
-            if name == "mds":
-                implementation = keyring_implementation_mds(self.model)
-            if name == "mon":
-                implementation = keyring_implementation_mon(self.model)
-            if name == "osd":
-                implementation = keyring_implementation_osd(self.model)
-            if name == "rgw":
-                implementation = keyring_implementation_rgw(self.model)
-            if implementation is None:
-                self._clear_implementation()
-                raise ValueError("Programming error for key_type with value:%s" % (name))
-            try:
-                implementation.get_path_keyring()
-            except (Error) as err:
-                self._clear_implementation()
-                raise err
-            self._keyImp = implementation
-            self._keyType = name
-            return self._keyType
-
-
-        def fdel(self):
-            self._clear_implementation()
-
-
-        return locals()
-
-
-    def present(self):
-        """
-        Create keyring
-        """
-        if self._keyImp is None:
-            raise Error("Programming error: key type unset")
-        return self._keyImp.present()
-
-
-    def create(self, secret = None):
-        """
-        Create keyring
-        """
-        if self._keyImp is None:
-            raise Error("Programming error: key type unset")
-        return self._keyImp.create(secret)
-
-
-    def write_content(self, key_content):
-        """
-        Persist keyring
-        """
-        if self._keyImp is None:
-            raise Error("Programming error: key type unset")
-        return self._keyImp.write_content(key_content)
-
-
-    def write_secret(self, secret):
-        """
-        Persist keyring
-        """
-        if self._keyImp is None:
-            raise Error("Programming error: key type unset")
-        return self._keyImp.write_secret(secret)
-
-
-    def remove(self):
-        """
-        Remove keyring
-        """
-        if self._keyImp is None:
-            raise Error("Programming error: key type unset")
-        return self._keyImp.remove()
 
 
     def keyring_path_get(self):
         """
         Get keyring path
         """
-        if self._keyImp is None:
-            raise Error("Programming error: key type unset")
-        return self._keyImp.get_path_keyring()
+        return KEYRINGS[self.key_type]["path"] % self.model.cluster_name
 
 
     def keyring_identity_get(self):
         """
-        Get keyring path
+        Get keyring name
         """
-        if self._keyImp is None:
-            raise Error("Programming error: key type unset")
-        return self._keyImp.keyring_name
+        return KEYRINGS[self.key_type]["name"]
+
